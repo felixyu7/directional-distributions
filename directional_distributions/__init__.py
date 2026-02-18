@@ -3,6 +3,7 @@
 from .vmf import von_mises_fisher_loss, VMF
 from .iag import iag_nll_loss, IAG
 from .esag import esag_nll_loss, ESAG
+from .sh import sh_nll_loss, SH
 from ._base import SphereGrid, make_grid
 from ._plotting import plot_mollweide
 
@@ -11,10 +12,12 @@ __all__ = [
     "von_mises_fisher_loss",
     "iag_nll_loss",
     "esag_nll_loss",
+    "sh_nll_loss",
     # Distribution classes
     "VMF",
     "IAG",
     "ESAG",
+    "SH",
     # Grid utilities
     "SphereGrid",
     "make_grid",
