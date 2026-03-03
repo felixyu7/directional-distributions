@@ -17,7 +17,54 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ._base import BaseDistribution, _construct_orthonormal_basis, _build_cholesky, _log_M2
+from ._base import BaseDistribution, _construct_orthonormal_basis, _build_cholesky
+
+
+# ---------------------------------------------------------------------------
+# AG-family math utility
+# ---------------------------------------------------------------------------
+
+def _log_M2(alpha: Tensor) -> Tensor:
+    """Compute log(M_2(alpha)) numerically stably.
+
+    M_2(alpha) = (1 + alpha^2) * Phi(alpha) + alpha * phi(alpha)
+
+    where Phi is the standard normal CDF and phi is the standard normal PDF.
+
+    For large negative alpha, direct computation suffers from catastrophic
+    cancellation. We use torch.special.log_ndtr for the tail, which provides
+    correct values and gradients even for alpha << 0.
+
+    Reference: Paine et al. (2018), Stat Comput 28:689-697, Equation (4).
+    """
+    # Direct computation (accurate for moderate alpha)
+    log_phi = -0.5 * alpha ** 2 - 0.5 * np.log(2 * np.pi)
+    phi = torch.exp(log_phi)
+    Phi = 0.5 * (1.0 + torch.erf(alpha / np.sqrt(2)))
+    M2_direct = (1.0 + alpha ** 2) * Phi + alpha * phi
+
+    # Stable computation for large negative alpha:
+    #   M_2(alpha) = Phi(alpha) * [(1+alpha^2) + alpha * phi(alpha)/Phi(alpha)]
+    #   log M_2 = log Phi(alpha) + log[(1+alpha^2) + alpha * exp(log phi(alpha) - log Phi(alpha))]
+    #
+    # The inner term (1+alpha^2) + alpha*phi/Phi ~ 2/alpha^2 for large |alpha|, computed as the
+    # difference of two ~alpha^2-sized quantities. Float32 loses all significant
+    # digits around |alpha| > 26, so we upcast to float64 for this subtraction.
+    #
+    # log_ndtr is not implemented for half/bfloat16 on CPU, so upcast if needed.
+    compute_dtype = torch.float64 if alpha.dtype != torch.float64 else torch.float64
+    alpha_hi = alpha.to(compute_dtype)
+    log_phi_hi = -0.5 * alpha_hi ** 2 - 0.5 * np.log(2 * np.pi)
+    log_Phi_hi = torch.special.log_ndtr(alpha_hi)
+    ratio_hi = alpha_hi * torch.exp(log_phi_hi - log_Phi_hi)
+    inner_hi = (1.0 + alpha_hi ** 2) + ratio_hi
+    M2_stable = (log_Phi_hi + torch.log(torch.clamp(inner_hi, min=1e-300))).to(alpha.dtype)
+
+    # Use direct for alpha >= -3.5, stable form for alpha < -3.5.
+    # The direct branch suffers catastrophic cancellation in M2_direct for
+    # alpha < ~-3.8 (float32), while the stable branch (computed in float64)
+    # is accurate for all alpha < 0.
+    return torch.where(alpha >= -3.5, torch.log(torch.clamp(M2_direct, min=1e-40)), M2_stable)
 
 
 # ---------------------------------------------------------------------------

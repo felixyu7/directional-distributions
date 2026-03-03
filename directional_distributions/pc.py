@@ -12,11 +12,87 @@ Tsagris & Alzeley (2024), "Circular and Spherical Projected Cauchy
 Distributions", arXiv:2302.02468v4.
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ._base import BaseDistribution, _construct_orthonormal_basis, _build_cholesky, _sc_log_density
+from ._base import BaseDistribution, _construct_orthonormal_basis, _build_cholesky
+
+
+# ---------------------------------------------------------------------------
+# PC-family math utility
+# ---------------------------------------------------------------------------
+
+def _sc_log_density(A: Tensor, B: Tensor, Gamma_sq: Tensor) -> Tensor:
+    """Compute the log-density kernel shared by all spherical projected Cauchy distributions.
+
+    Given the three intermediate quantities from the projected Cauchy on S^2,
+    returns the log-PDF assuming |Sigma| = 1.
+
+    The density (Tsagris & Alzeley, 2024, Eq. 18 with |Sigma|=1) is:
+
+        log f = -log(4pi^2) - log(B) - 1.5*log(Delta) + log[B(Gamma^2+1)*Omega + 2A*sqrt(Delta)]
+
+    where Delta = B(Gamma^2+1) - A^2  and  Omega = 2(pi - atan2(sqrt(Delta), A)).
+
+    **Numerically stable formulation.** Direct computation of Delta = B*C - A^2
+    suffers catastrophic cancellation when B and Gamma^2 are large (e.g. extreme
+    Cholesky eigenvalues), since both terms overflow to inf before subtraction.
+
+    We instead factor via the Cauchy-Schwarz identity:
+        A = sqrt(B) * sqrt(Gamma^2) * cos(theta)
+        Delta = B * (Gamma^2 * sin^2(theta) + 1)   (no cancellation; always >= B)
+
+    Then factor B out of inner:
+        Delta/B = r^2  where  r^2 = Gamma^2*sin^2(theta) + 1
+        inner/B = (Gamma^2+1)*Omega + 2*sqrt(Gamma^2)*cos(theta)*r
+
+    Final log-density:
+        log f = -log(4pi^2) - 1.5*log(B) - 1.5*log(r^2) + log(inner_reduced)
+
+    Reference: Tsagris & Alzeley (2024), "Circular and Spherical Projected
+    Cauchy Distributions", arXiv:2302.02468v4, Equation (18).
+
+    Args:
+        A: [...] y^T Sigma^{-1} mu.
+        B: [...] y^T Sigma^{-1} y (positive).
+        Gamma_sq: [...] mu^T Sigma^{-1} mu (non-negative).
+
+    Returns:
+        [...] log-probability density values (same shape as inputs).
+    """
+    # Normalized quantities that stay O(1) regardless of scale
+    sqrt_B = torch.sqrt(torch.clamp(B, min=1e-30))
+    sqrt_G = torch.sqrt(torch.clamp(Gamma_sq, min=0.0))
+
+    # cos theta = A / (sqrt(B) * sqrt(Gamma^2)), clamped to [-1, 1] for numerical safety
+    denom = sqrt_B * sqrt_G
+    # When Gamma_sq ~ 0, cos_theta is irrelevant (sin^2(theta)*Gamma^2 -> 0 anyway)
+    cos_theta = torch.where(
+        denom > 1e-15,
+        torch.clamp(A / denom, min=-1.0, max=1.0),
+        torch.zeros_like(A),
+    )
+    sin_sq_theta = 1.0 - cos_theta ** 2
+
+    # r^2 = Gamma^2*sin^2(theta) + 1  (always >= 1, no cancellation)
+    r_sq = Gamma_sq * sin_sq_theta + 1.0
+    r = torch.sqrt(r_sq)
+
+    # Omega = 2(pi - atan2(sqrt(Delta), A)) with sqrt(Delta) = sqrt(B) * r, A = sqrt(B) * sqrt(Gamma^2) * cos(theta)
+    # atan2(sqrt(B) * r, sqrt(B) * sqrt(Gamma^2) * cos(theta)) = atan2(r, sqrt(Gamma^2) * cos(theta))  [sqrt(B) cancels]
+    Omega = 2.0 * (math.pi - torch.atan2(r, sqrt_G * cos_theta))
+
+    # inner_reduced = (Gamma^2+1)*Omega + 2*sqrt(Gamma^2)*cos(theta)*r   [B factored out]
+    inner_reduced = (Gamma_sq + 1.0) * Omega + 2.0 * sqrt_G * cos_theta * r
+    inner_reduced = torch.clamp(inner_reduced, min=1e-30)
+
+    return (-math.log(4.0 * math.pi ** 2)
+            - 1.5 * torch.log(torch.clamp(B, min=1e-30))
+            - 1.5 * torch.log(r_sq)
+            + torch.log(inner_reduced))
 
 
 # ---------------------------------------------------------------------------
