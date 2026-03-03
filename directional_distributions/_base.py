@@ -94,19 +94,25 @@ def _log_M2(alpha: Tensor) -> Tensor:
     # Stable computation for large negative alpha:
     #   M₂(α) = Φ(α) · [(1+α²) + α · φ(α)/Φ(α)]
     #   log M₂ = log Φ(α) + log[(1+α²) + α · exp(log φ(α) - log Φ(α))]
+    #
+    # The inner term (1+α²) + α·φ/Φ ≈ 2/α² for large |α|, computed as the
+    # difference of two ~α²-sized quantities. Float32 loses all significant
+    # digits around |α| > 26, so we upcast to float64 for this subtraction.
+    #
     # log_ndtr is not implemented for half/bfloat16 on CPU, so upcast if needed.
-    needs_upcast = alpha.dtype in (torch.float16, torch.bfloat16) and not alpha.is_cuda
-    if needs_upcast:
-        log_Phi = torch.special.log_ndtr(alpha.float()).to(alpha.dtype)
-    else:
-        log_Phi = torch.special.log_ndtr(alpha)
-    ratio = alpha * torch.exp(log_phi - log_Phi)
-    inner = (1.0 + alpha ** 2) + ratio
-    # inner should be positive; clamp to avoid log(0) from numerical noise
-    M2_stable = log_Phi + torch.log(torch.clamp(inner, min=1e-40))
+    compute_dtype = torch.float64 if alpha.dtype != torch.float64 else torch.float64
+    alpha_hi = alpha.to(compute_dtype)
+    log_phi_hi = -0.5 * alpha_hi ** 2 - 0.5 * np.log(2 * np.pi)
+    log_Phi_hi = torch.special.log_ndtr(alpha_hi)
+    ratio_hi = alpha_hi * torch.exp(log_phi_hi - log_Phi_hi)
+    inner_hi = (1.0 + alpha_hi ** 2) + ratio_hi
+    M2_stable = (log_Phi_hi + torch.log(torch.clamp(inner_hi, min=1e-300))).to(alpha.dtype)
 
-    # Use direct for alpha >= -6, stable form for alpha < -6
-    return torch.where(alpha >= -6.0, torch.log(torch.clamp(M2_direct, min=1e-40)), M2_stable)
+    # Use direct for alpha >= -3.5, stable form for alpha < -3.5.
+    # The direct branch suffers catastrophic cancellation in M2_direct for
+    # alpha < ~-3.8 (float32), while the stable branch (computed in float64)
+    # is accurate for all alpha < 0.
+    return torch.where(alpha >= -3.5, torch.log(torch.clamp(M2_direct, min=1e-40)), M2_stable)
 
 
 def _sc_log_density(A: Tensor, B: Tensor, Gamma_sq: Tensor) -> Tensor:
@@ -115,11 +121,26 @@ def _sc_log_density(A: Tensor, B: Tensor, Gamma_sq: Tensor) -> Tensor:
     Given the three intermediate quantities from the projected Cauchy on S²,
     returns the log-PDF assuming |Σ| = 1.
 
-    The density (Tsagris & Alzeley, 2024, Eq. 18 with |Σ|=1) simplifies to:
+    The density (Tsagris & Alzeley, 2024, Eq. 18 with |Σ|=1) is:
 
         log f = -log(4π²) - log(B) - 1.5·log(Δ) + log[B(Γ²+1)·Ω + 2A√Δ]
 
     where Δ = B(Γ²+1) - A²  and  Ω = 2(π - atan2(√Δ, A)).
+
+    **Numerically stable formulation.** Direct computation of Δ = B·C - A²
+    suffers catastrophic cancellation when B and Γ² are large (e.g. extreme
+    Cholesky eigenvalues), since both terms overflow to inf before subtraction.
+
+    We instead factor via the Cauchy-Schwarz identity:
+        A = √B · √Γ² · cos θ      (where θ is the angle in the transformed space)
+        Δ = B · (Γ² · sin²θ + 1)   (no cancellation; always ≥ B)
+
+    Then factor B out of inner:
+        Δ/B = r²  where  r² = Γ²·sin²θ + 1
+        inner/B = (Γ²+1)·Ω + 2·√Γ²·cosθ·r
+
+    Final log-density:
+        log f = -log(4π²) - 1.5·log(B) - 1.5·log(r²) + log(inner_reduced)
 
     Reference: Tsagris & Alzeley (2024), "Circular and Spherical Projected
     Cauchy Distributions", arXiv:2302.02468v4, Equation (18).
@@ -132,20 +153,36 @@ def _sc_log_density(A: Tensor, B: Tensor, Gamma_sq: Tensor) -> Tensor:
     Returns:
         [...] log-probability density values (same shape as inputs).
     """
-    Gamma_sq_p1 = Gamma_sq + 1.0
-    Delta = B * Gamma_sq_p1 - A ** 2               # >= B > 0 by Cauchy-Schwarz
-    Delta = torch.clamp(Delta, min=1e-8)
+    # Normalized quantities that stay O(1) regardless of scale
+    sqrt_B = torch.sqrt(torch.clamp(B, min=1e-30))
+    sqrt_G = torch.sqrt(torch.clamp(Gamma_sq, min=0.0))
 
-    sqrt_Delta = torch.sqrt(Delta)
-    Omega = 2.0 * (np.pi - torch.atan2(sqrt_Delta, A))
+    # cos θ = A / (√B · √Γ²), clamped to [-1, 1] for numerical safety
+    denom = sqrt_B * sqrt_G
+    # When Gamma_sq ≈ 0, cos_theta is irrelevant (sin²θ·Γ² → 0 anyway)
+    cos_theta = torch.where(
+        denom > 1e-15,
+        torch.clamp(A / denom, min=-1.0, max=1.0),
+        torch.zeros_like(A),
+    )
+    sin_sq_theta = 1.0 - cos_theta ** 2
 
-    inner = B * Gamma_sq_p1 * Omega + 2.0 * A * sqrt_Delta
-    inner = torch.clamp(inner, min=1e-30)
+    # r² = Γ²·sin²θ + 1  (always ≥ 1, no cancellation)
+    r_sq = Gamma_sq * sin_sq_theta + 1.0
+    r = torch.sqrt(r_sq)
+
+    # Ω = 2(π - atan2(√Δ, A)) with √Δ = √B · r, A = √B · √Γ² · cosθ
+    # atan2(√B · r, √B · √Γ² · cosθ) = atan2(r, √Γ² · cosθ)  [√B cancels]
+    Omega = 2.0 * (np.pi - torch.atan2(r, sqrt_G * cos_theta))
+
+    # inner_reduced = (Γ²+1)·Ω + 2·√Γ²·cosθ·r   [B factored out]
+    inner_reduced = (Gamma_sq + 1.0) * Omega + 2.0 * sqrt_G * cos_theta * r
+    inner_reduced = torch.clamp(inner_reduced, min=1e-30)
 
     return (-np.log(4.0 * np.pi ** 2)
-            - torch.log(torch.clamp(B, min=1e-8))
-            - 1.5 * torch.log(Delta)
-            + torch.log(inner))
+            - 1.5 * torch.log(torch.clamp(B, min=1e-30))
+            - 1.5 * torch.log(r_sq)
+            + torch.log(inner_reduced))
 
 
 def _construct_orthonormal_basis(mu: Tensor) -> Tuple[Tensor, Tensor]:
