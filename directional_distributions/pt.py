@@ -180,10 +180,11 @@ def ipt_nll_loss(
         pred: [B, 3] predictions where pred[:, :3] = μ (mean vector,
               magnitude controls concentration).
         y_true: [B, 3] true unit direction vectors on S².
-        nu: positive integer degrees of freedom (default 3).
+        nu: positive integer degrees of freedom (default 5).
+        reduction: ``"mean"`` (default), ``"sum"``, or ``"none"``.
 
     Returns:
-        Scalar mean NLL loss over the batch.
+        Reduced NLL loss (scalar for ``"mean"``/``"sum"``, [B] for ``"none"``).
     """
     mu = pred[:, :3]                                  # [B, 3]
     y = F.normalize(y_true, p=2, dim=1)               # [B, 3]
@@ -269,10 +270,11 @@ def ept_nll_loss(
               - pred[:, :3]  = μ (mean vector, magnitude controls concentration)
               - pred[:, 3:5] = γ = (γ₁, γ₂) (shape parameters for ellipticity)
         y_true: [B, 3] true unit direction vectors on S².
-        nu: positive integer degrees of freedom (default 3).
+        nu: positive integer degrees of freedom (default 5).
+        reduction: ``"mean"`` (default), ``"sum"``, or ``"none"``.
 
     Returns:
-        Scalar mean NLL loss over the batch.
+        Reduced NLL loss (scalar for ``"mean"``/``"sum"``, [B] for ``"none"``).
     """
     mu = pred[:, :3]                                    # [B, 3]
     gamma1 = pred[:, 3]                                 # [B]
@@ -403,10 +405,11 @@ def gpt_nll_loss(
               - pred[:, 3:6] = raw log-diagonal of Cholesky factor L
               - pred[:, 6:9] = off-diagonal entries (L₂₁, L₃₁, L₃₂)
         y_true: [B, 3] true unit direction vectors on S².
-        nu: positive integer degrees of freedom (default 3).
+        nu: positive integer degrees of freedom (default 5).
+        reduction: ``"mean"`` (default), ``"sum"``, or ``"none"``.
 
     Returns:
-        Scalar mean NLL loss over the batch.
+        Reduced NLL loss (scalar for ``"mean"``/``"sum"``, [B] for ``"none"``).
     """
     mu = pred[:, :3]                                     # [B, 3]
     y = F.normalize(y_true, p=2, dim=1)                  # [B, 3]
