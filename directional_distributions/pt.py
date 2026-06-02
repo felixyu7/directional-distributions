@@ -4,7 +4,7 @@ This module collects the three members of the projected multivariate t
 family, obtained by projecting a trivariate Student-t  t_ν(μ, Σ)  onto
 the sphere via  z → z/‖z‖.  They form a nested hierarchy:
 
-    IPT (3 params)  <  EPT (5 params)  <  GPT (9 params)
+    IPT (3 params)  <  EPT (5 params)  <  GPT (8 params)
 
 The degrees-of-freedom parameter ν is a fixed positive integer passed
 at construction time (not learned by the network).
@@ -395,15 +395,16 @@ def gpt_nll_loss(
 ) -> Tensor:
     """General Projected t (GPT) negative log-likelihood loss.
 
-    The GPT is the full 9-parameter projected t on S², with Σ⁻¹
+    The GPT is the full 8-parameter projected t on S², with Σ⁻¹
     parameterised as LLᵀ via a log-Cholesky factor with det(L) = 1,
     identical to the GAG/GSPC parameterisation.
 
     Args:
-        pred: [B, 9] predictions where:
+        pred: [B, 8] predictions where:
               - pred[:, :3]  = μ  (mean vector, unconstrained)
-              - pred[:, 3:6] = raw log-diagonal of Cholesky factor L
-              - pred[:, 6:9] = off-diagonal entries (L₂₁, L₃₁, L₃₂)
+              - pred[:, 3:5] = log L₁₁, log L₂₂ (log-diagonal of L;
+                               log L₃₃ fixed by det(L) = 1)
+              - pred[:, 5:8] = off-diagonal entries (L₂₁, L₃₁, L₃₂)
         y_true: [B, 3] true unit direction vectors on S².
         nu: positive integer degrees of freedom (default 5).
         reduction: ``"mean"`` (default), ``"sum"``, or ``"none"``.
@@ -429,20 +430,21 @@ def gpt_nll_loss(
 class GPT(BaseDistribution):
     """General Projected t distribution on S².
 
-    The GPT is the full 9-parameter projected t, generalising EPT
+    The GPT is the full 8-parameter projected t, generalising EPT
     by allowing the scatter matrix eigenvectors to be independent of μ.
     This enables asymmetric, non-elliptical contours on the sphere.
 
     Σ⁻¹ is parameterised via a log-Cholesky factor L with det(L) = 1.
 
     Args:
-        pred: [B, 9] raw network output where pred[:, :3] is μ,
-            pred[:, 3:6] is the raw log-diagonal of L, and
-            pred[:, 6:9] is the off-diagonal (L₂₁, L₃₁, L₃₂).
+        pred: [B, 8] raw network output where pred[:, :3] is μ,
+            pred[:, 3:5] is (log L₁₁, log L₂₂) (log L₃₃ fixed by
+            det(L) = 1), and pred[:, 5:8] is the off-diagonal
+            (L₂₁, L₃₁, L₃₂).
         nu: positive integer degrees of freedom (default 3).
     """
 
-    n_params = 9
+    n_params = 8
 
     def __init__(self, pred: Tensor, nu: int = 5) -> None:
         super().__init__(pred)

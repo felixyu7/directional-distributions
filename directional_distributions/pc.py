@@ -329,10 +329,11 @@ def gspc_nll_loss(pred: Tensor, y_true: Tensor, reduction: str = "mean") -> Tens
     Reference: Tsagris & Alzeley (2024), arXiv:2302.02468v4, Eq. (18).
 
     Args:
-        pred: [B, 9] predictions where:
+        pred: [B, 8] predictions where:
               - pred[:, :3]  = mu  (mean vector, unconstrained)
-              - pred[:, 3:6] = raw log-diagonal of Cholesky factor L
-              - pred[:, 6:9] = off-diagonal entries (L_21, L_31, L_32)
+              - pred[:, 3:5] = log L_11, log L_22 (log-diagonal of L;
+                               log L_33 fixed by det(L) = 1)
+              - pred[:, 5:8] = off-diagonal entries (L_21, L_31, L_32)
         y_true: [B, 3] true unit direction vectors on S^2.
         reduction: ``"mean"`` (default), ``"sum"``, or ``"none"``.
 
@@ -366,12 +367,13 @@ class GSPC(BaseDistribution):
     Reference: Tsagris & Alzeley (2024), arXiv:2302.02468v4, Eq. (18).
 
     Args:
-        pred: [B, 9] raw network output where pred[:, :3] is mu,
-            pred[:, 3:6] is the raw log-diagonal of L, and
-            pred[:, 6:9] is the off-diagonal (L_21, L_31, L_32).
+        pred: [B, 8] raw network output where pred[:, :3] is mu,
+            pred[:, 3:5] is (log L_11, log L_22) (log L_33 fixed by
+            det(L) = 1), and pred[:, 5:8] is the off-diagonal
+            (L_21, L_31, L_32).
     """
 
-    n_params = 9
+    n_params = 8
 
     @property
     def mean_direction(self) -> Tensor:
