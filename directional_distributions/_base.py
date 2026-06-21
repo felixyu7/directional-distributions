@@ -141,9 +141,18 @@ def _build_cholesky(pred: Tensor) -> Tensor:
     """Construct the normalised lower-triangular Cholesky factor L from raw
     network outputs.
 
+    The det(L) = 1 constraint is enforced directly: only two log-diagonal
+    entries are taken from the network and the third is fixed by
+    log L₃₃ = -(log L₁₁ + log L₂₂), so the diagonal entries multiply to 1.
+    This consumes exactly the 2 degrees of freedom the constraint leaves,
+    avoiding the translation gauge-freedom that arises when mean-centring
+    three log-diagonal outputs (where adding a constant to all three is a
+    no-op and the corresponding output direction receives zero gradient).
+
     Args:
-        pred: [B, 9] where pred[:, 3:6] are raw log-diagonal entries and
-              pred[:, 6:9] are off-diagonal entries (L₂₁, L₃₁, L₃₂).
+        pred: [B, 8] where pred[:, 3:5] are the first two log-diagonal
+              entries (log L₁₁, log L₂₂) and pred[:, 5:8] are the
+              off-diagonal entries (L₂₁, L₃₁, L₃₂).
 
     Returns:
         L: [B, 3, 3] lower-triangular with det(L) = 1 and V⁻¹ = LLᵀ SPD.
@@ -151,12 +160,12 @@ def _build_cholesky(pred: Tensor) -> Tensor:
     B = pred.shape[0]
     device, dtype = pred.device, pred.dtype
 
-    raw_log_diag = pred[:, 3:6]   # [B, 3]
-    off_diag = pred[:, 6:9]       # [B, 3]  → L₂₁, L₃₁, L₃₂
+    log_diag_12 = pred[:, 3:5]   # [B, 2]  → log L₁₁, log L₂₂
+    off_diag = pred[:, 5:8]      # [B, 3]  → L₂₁, L₃₁, L₃₂
 
-    # Centre log-diagonal so that sum = 0  ⟹  det(L) = exp(0) = 1
-    log_diag = raw_log_diag - raw_log_diag.mean(dim=1, keepdim=True)
-    diag = torch.exp(log_diag)    # [B, 3], always positive, product = 1
+    # Third log-diagonal fixed by det(L) = 1  ⟹  Σ log Lᵢᵢ = 0
+    log_diag_3 = -log_diag_12.sum(dim=1, keepdim=True)             # [B, 1]
+    diag = torch.exp(torch.cat([log_diag_12, log_diag_3], dim=1))  # [B, 3], product = 1
 
     # Assemble L  (lower triangular)
     L = torch.zeros(B, 3, 3, device=device, dtype=dtype)
