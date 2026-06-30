@@ -20,6 +20,7 @@ from torch import Tensor
 from ._base import (
     BaseDistribution,
     _apply_reduction,
+    _compute_dtype,
     _construct_orthonormal_basis,
     _build_cholesky,
     make_grid,
@@ -215,19 +216,21 @@ def iag_nll_loss(pred: Tensor, y_true: Tensor, reduction: str = "mean") -> Tenso
     Returns:
         Reduced NLL loss (scalar for ``"mean"``/``"sum"``, [B] for ``"none"``).
     """
-    mu = pred  # [B, 3]
+    # The erf/exp kernel is unstable in bf16/fp16; compute it in fp32 with
+    # autocast disabled, then cast the loss back (matches the vMF loss).
+    orig_dtype = pred.dtype
+    dtype = _compute_dtype(orig_dtype)
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        mu = pred.to(dtype)                            # [B, 3]
+        y = F.normalize(y_true.to(dtype), p=2, dim=1)  # [B, 3]
 
-    # Normalize y_true to ensure unit vectors
-    y = F.normalize(y_true, p=2, dim=1)  # [B, 3]
+        mu_norm_sq = (mu ** 2).sum(dim=1)  # ||mu||^2 [B]
+        y_dot_mu = (y * mu).sum(dim=1)     # y.mu [B]
 
-    # Compute terms
-    mu_norm_sq = (mu ** 2).sum(dim=1)  # ||mu||^2 [B]
-    y_dot_mu = (y * mu).sum(dim=1)     # y.mu [B]
-
-    # NLL = log(2pi) - angular-Gaussian log kernel with Q = 1
-    nll = _LOG_2PI - _ag_log_kernel(torch.ones_like(y_dot_mu), mu_norm_sq, y_dot_mu)
-
-    return _apply_reduction(nll, reduction)
+        # NLL = log(2pi) - angular-Gaussian log kernel with Q = 1
+        nll = _LOG_2PI - _ag_log_kernel(torch.ones_like(y_dot_mu), mu_norm_sq, y_dot_mu)
+        loss = _apply_reduction(nll, reduction)
+    return loss.to(orig_dtype)
 
 
 class IAG(BaseDistribution):
@@ -266,17 +269,20 @@ class IAG(BaseDistribution):
         Returns:
             [B, N] log-probability density.
         """
-        mu = self._pred  # [B, 3]
-        mu_norm_sq = (mu ** 2).sum(dim=1)  # [B]
+        orig_dtype = self._pred.dtype
+        dtype = _compute_dtype(orig_dtype)
+        with torch.autocast(device_type=self._pred.device.type, enabled=False):
+            mu = self._pred.to(dtype)  # [B, 3]
+            points = points.to(dtype)
+            mu_norm_sq = (mu ** 2).sum(dim=1)  # [B]
 
-        y_dot_mu = points @ mu.T  # [N, B]
-        # log f = -log(2pi) + angular-Gaussian log kernel with Q = 1
-        log_p = (
-            -_LOG_2PI
-            + _ag_log_kernel(torch.ones_like(y_dot_mu), mu_norm_sq[None, :], y_dot_mu)
-        )
-
-        return log_p.T  # [B, N]
+            y_dot_mu = points @ mu.T  # [N, B]
+            # log f = -log(2pi) + angular-Gaussian log kernel with Q = 1
+            log_p = (
+                -_LOG_2PI
+                + _ag_log_kernel(torch.ones_like(y_dot_mu), mu_norm_sq[None, :], y_dot_mu)
+            )
+        return log_p.T.to(orig_dtype)  # [B, N]
 
     def mode(self) -> Tensor:
         """MAP direction on S^2.
@@ -322,43 +328,48 @@ def esag_nll_loss(pred: Tensor, y_true: Tensor, reduction: str = "mean") -> Tens
     Returns:
         Reduced NLL loss (scalar for ``"mean"``/``"sum"``, [B] for ``"none"``).
     """
-    mu = pred[:, :3]      # [B, 3]
-    gamma1 = pred[:, 3]   # [B]
-    gamma2 = pred[:, 4]   # [B]
+    # The erf/exp kernel is unstable in bf16/fp16; compute it in fp32 with
+    # autocast disabled, then cast the loss back (matches the vMF loss).
+    orig_dtype = pred.dtype
+    dtype = _compute_dtype(orig_dtype)
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        pred = pred.to(dtype)
+        mu = pred[:, :3]      # [B, 3]
+        gamma1 = pred[:, 3]   # [B]
+        gamma2 = pred[:, 4]   # [B]
 
-    # Normalize y_true to ensure unit vectors
-    y = F.normalize(y_true, p=2, dim=1)  # [B, 3]
+        y = F.normalize(y_true.to(dtype), p=2, dim=1)  # [B, 3]
 
-    # Basic terms
-    mu_norm_sq = (mu ** 2).sum(dim=1)  # ||mu||^2 [B]
-    y_dot_mu = (y * mu).sum(dim=1)     # y.mu [B]
+        # Basic terms
+        mu_norm_sq = (mu ** 2).sum(dim=1)  # ||mu||^2 [B]
+        y_dot_mu = (y * mu).sum(dim=1)     # y.mu [B]
 
-    # Construct orthonormal basis {xi_1, xi_2} perpendicular to mu
-    xi1, xi2 = _construct_orthonormal_basis(mu)  # [B, 3] each
+        # Construct orthonormal basis {xi_1, xi_2} perpendicular to mu
+        xi1, xi2 = _construct_orthonormal_basis(mu)  # [B, 3] each
 
-    # Projections of y onto the basis vectors
-    a = (y * xi1).sum(dim=1)  # y.xi_1 [B]
-    b = (y * xi2).sum(dim=1)  # y.xi_2 [B]
+        # Projections of y onto the basis vectors
+        a = (y * xi1).sum(dim=1)  # y.xi_1 [B]
+        b = (y * xi2).sum(dim=1)  # y.xi_2 [B]
 
-    # Compute y'V^{-1}y using Equation (18):
-    # y'V^{-1}y = 1 + gamma_1(a^2 - b^2) + 2*gamma_2*a*b + (sqrt(1 + gamma_1^2 + gamma_2^2) - 1)(a^2 + b^2)
-    gamma_sq = gamma1 ** 2 + gamma2 ** 2
-    sqrt_term = torch.sqrt(1.0 + gamma_sq)
-    a_sq_plus_b_sq = a ** 2 + b ** 2
+        # Compute y'V^{-1}y using Equation (18):
+        # y'V^{-1}y = 1 + gamma_1(a^2 - b^2) + 2*gamma_2*a*b + (sqrt(1 + gamma_1^2 + gamma_2^2) - 1)(a^2 + b^2)
+        gamma_sq = gamma1 ** 2 + gamma2 ** 2
+        sqrt_term = torch.sqrt(1.0 + gamma_sq)
+        a_sq_plus_b_sq = a ** 2 + b ** 2
 
-    y_Vinv_y = (1.0
-                + gamma1 * (a ** 2 - b ** 2)
-                + 2.0 * gamma2 * a * b
-                + (sqrt_term - 1.0) * a_sq_plus_b_sq)
+        y_Vinv_y = (1.0
+                    + gamma1 * (a ** 2 - b ** 2)
+                    + 2.0 * gamma2 * a * b
+                    + (sqrt_term - 1.0) * a_sq_plus_b_sq)
 
-    # Clamp for numerical stability (V^{-1} is positive definite, so this should be > 0)
-    y_Vinv_y = torch.clamp(y_Vinv_y, min=1e-8)
+        # Clamp for numerical stability (V^{-1} is positive definite, so this should be > 0)
+        y_Vinv_y = torch.clamp(y_Vinv_y, min=1e-8)
 
-    # NLL = log(2pi) - angular-Gaussian log kernel
-    alpha = y_dot_mu / torch.sqrt(y_Vinv_y)
-    nll = _LOG_2PI - _ag_log_kernel(y_Vinv_y, mu_norm_sq, alpha)
-
-    return _apply_reduction(nll, reduction)
+        # NLL = log(2pi) - angular-Gaussian log kernel
+        alpha = y_dot_mu / torch.sqrt(y_Vinv_y)
+        nll = _LOG_2PI - _ag_log_kernel(y_Vinv_y, mu_norm_sq, alpha)
+        loss = _apply_reduction(nll, reduction)
+    return loss.to(orig_dtype)
 
 
 class ESAG(BaseDistribution):
@@ -401,37 +412,40 @@ class ESAG(BaseDistribution):
         Returns:
             [B, N] log-probability density.
         """
-        mu = self._pred[:, :3]       # [B, 3]
-        gamma1 = self._pred[:, 3]    # [B]
-        gamma2 = self._pred[:, 4]    # [B]
+        orig_dtype = self._pred.dtype
+        dtype = _compute_dtype(orig_dtype)
+        with torch.autocast(device_type=self._pred.device.type, enabled=False):
+            mu = self._pred[:, :3].to(dtype)   # [B, 3]
+            gamma1 = self._pred[:, 3].to(dtype) # [B]
+            gamma2 = self._pred[:, 4].to(dtype) # [B]
+            points = points.to(dtype)
 
-        mu_norm_sq = (mu ** 2).sum(dim=1)  # [B]
+            mu_norm_sq = (mu ** 2).sum(dim=1)  # [B]
 
-        # Construct orthonormal basis perpendicular to mu
-        xi1, xi2 = _construct_orthonormal_basis(mu)  # [B, 3] each
+            # Construct orthonormal basis perpendicular to mu
+            xi1, xi2 = _construct_orthonormal_basis(mu)  # [B, 3] each
 
-        # y.mu, y.xi_1, y.xi_2 for all (point, sample) pairs
-        y_dot_mu = points @ mu.T    # [N, B]
-        a = points @ xi1.T          # [N, B]  (y.xi_1)
-        b = points @ xi2.T          # [N, B]  (y.xi_2)
+            # y.mu, y.xi_1, y.xi_2 for all (point, sample) pairs
+            y_dot_mu = points @ mu.T    # [N, B]
+            a = points @ xi1.T          # [N, B]  (y.xi_1)
+            b = points @ xi2.T          # [N, B]  (y.xi_2)
 
-        # y'V^{-1}y (Equation 18)
-        gamma_sq = gamma1 ** 2 + gamma2 ** 2        # [B]
-        sqrt_term = torch.sqrt(1.0 + gamma_sq)      # [B]
-        a_sq_plus_b_sq = a ** 2 + b ** 2             # [N, B]
+            # y'V^{-1}y (Equation 18)
+            gamma_sq = gamma1 ** 2 + gamma2 ** 2        # [B]
+            sqrt_term = torch.sqrt(1.0 + gamma_sq)      # [B]
+            a_sq_plus_b_sq = a ** 2 + b ** 2             # [N, B]
 
-        y_Vinv_y = (1.0
-                    + gamma1[None, :] * (a ** 2 - b ** 2)
-                    + 2.0 * gamma2[None, :] * a * b
-                    + (sqrt_term - 1.0)[None, :] * a_sq_plus_b_sq)
+            y_Vinv_y = (1.0
+                        + gamma1[None, :] * (a ** 2 - b ** 2)
+                        + 2.0 * gamma2[None, :] * a * b
+                        + (sqrt_term - 1.0)[None, :] * a_sq_plus_b_sq)
 
-        y_Vinv_y = torch.clamp(y_Vinv_y, min=1e-8)  # [N, B]
+            y_Vinv_y = torch.clamp(y_Vinv_y, min=1e-8)  # [N, B]
 
-        # log f = -log(2pi) + angular-Gaussian log kernel
-        alpha = y_dot_mu / torch.sqrt(y_Vinv_y)
-        log_p = -_LOG_2PI + _ag_log_kernel(y_Vinv_y, mu_norm_sq[None, :], alpha)
-
-        return log_p.T  # [B, N]
+            # log f = -log(2pi) + angular-Gaussian log kernel
+            alpha = y_dot_mu / torch.sqrt(y_Vinv_y)
+            log_p = -_LOG_2PI + _ag_log_kernel(y_Vinv_y, mu_norm_sq[None, :], alpha)
+        return log_p.T.to(orig_dtype)  # [B, N]
 
     def mode(
         self,
@@ -525,26 +539,32 @@ def gag_nll_loss(pred: Tensor, y_true: Tensor, reduction: str = "mean") -> Tenso
     Returns:
         Reduced NLL loss (scalar for ``"mean"``/``"sum"``, [B] for ``"none"``).
     """
-    mu = pred[:, :3]                           # [B, 3]
-    y = F.normalize(y_true, p=2, dim=1)        # [B, 3]
-    L = _build_cholesky(pred)                  # [B, 3, 3]
+    # The erf/exp kernel and Cholesky exp are unstable in bf16/fp16; compute in
+    # fp32 with autocast disabled, then cast the loss back (matches the vMF loss).
+    orig_dtype = pred.dtype
+    dtype = _compute_dtype(orig_dtype)
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        pred = pred.to(dtype)
+        mu = pred[:, :3]                           # [B, 3]
+        y = F.normalize(y_true.to(dtype), p=2, dim=1)  # [B, 3]
+        L = _build_cholesky(pred)                  # [B, 3, 3]
 
-    # Transformed vectors: z_y = L^T y,  z_mu = L^T mu
-    # (batch matrix-vector multiply via einsum)
-    z_y = torch.einsum('bji,bj->bi', L, y)    # [B, 3]
-    z_mu = torch.einsum('bji,bj->bi', L, mu)  # [B, 3]
+        # Transformed vectors: z_y = L^T y,  z_mu = L^T mu
+        # (batch matrix-vector multiply via einsum)
+        z_y = torch.einsum('bji,bj->bi', L, y)    # [B, 3]
+        z_mu = torch.einsum('bji,bj->bi', L, mu)  # [B, 3]
 
-    Q = (z_y ** 2).sum(dim=1)                  # ||z_y||^2 = y^T V^{-1} y  [B]
-    S = (z_mu ** 2).sum(dim=1)                 # ||z_mu||^2 = mu^T V^{-1} mu  [B]
-    z_dot = (z_y * z_mu).sum(dim=1)            # z_y.z_mu = y^T V^{-1} mu  [B]
+        Q = (z_y ** 2).sum(dim=1)                  # ||z_y||^2 = y^T V^{-1} y  [B]
+        S = (z_mu ** 2).sum(dim=1)                 # ||z_mu||^2 = mu^T V^{-1} mu  [B]
+        z_dot = (z_y * z_mu).sum(dim=1)            # z_y.z_mu = y^T V^{-1} mu  [B]
 
-    Q_safe = torch.clamp(Q, min=1e-8)
-    T = z_dot / torch.sqrt(Q_safe)             # [B]
+        Q_safe = torch.clamp(Q, min=1e-8)
+        T = z_dot / torch.sqrt(Q_safe)             # [B]
 
-    # NLL = log(2pi) - angular-Gaussian log kernel
-    nll = _LOG_2PI - _ag_log_kernel(Q_safe, S, T)
-
-    return _apply_reduction(nll, reduction)
+        # NLL = log(2pi) - angular-Gaussian log kernel
+        nll = _LOG_2PI - _ag_log_kernel(Q_safe, S, T)
+        loss = _apply_reduction(nll, reduction)
+    return loss.to(orig_dtype)
 
 
 class GAG(BaseDistribution):
@@ -594,28 +614,32 @@ class GAG(BaseDistribution):
         Returns:
             [B, N] log-probability density.
         """
-        mu = self._pred[:, :3]                          # [B, 3]
-        L = _build_cholesky(self._pred)                 # [B, 3, 3]
+        orig_dtype = self._pred.dtype
+        dtype = _compute_dtype(orig_dtype)
+        with torch.autocast(device_type=self._pred.device.type, enabled=False):
+            pred = self._pred.to(dtype)
+            mu = pred[:, :3]                             # [B, 3]
+            L = _build_cholesky(pred)                    # [B, 3, 3]
+            points = points.to(dtype)
 
-        mu_Vinv_mu = (torch.einsum('bji,bj->bi', L, mu) ** 2).sum(dim=1)  # S [B]
+            mu_Vinv_mu = (torch.einsum('bji,bj->bi', L, mu) ** 2).sum(dim=1)  # S [B]
 
-        # Transform all grid points through each batch element's L^T:
-        # z_y[b, n, i] = L^T[b, i, j] . points[n, j] = L[b, j, i] . points[n, j]
-        z_y = torch.einsum('bji,nj->bni', L, points)   # [B, N, 3]
+            # Transform all grid points through each batch element's L^T:
+            # z_y[b, n, i] = L^T[b, i, j] . points[n, j] = L[b, j, i] . points[n, j]
+            z_y = torch.einsum('bji,nj->bni', L, points)   # [B, N, 3]
 
-        # Also transform mu: z_mu[b, i] = L^T[b, i, j] . mu[b, j]
-        z_mu = torch.einsum('bji,bj->bi', L, mu)       # [B, 3]
+            # Also transform mu: z_mu[b, i] = L^T[b, i, j] . mu[b, j]
+            z_mu = torch.einsum('bji,bj->bi', L, mu)       # [B, 3]
 
-        Q = (z_y ** 2).sum(dim=2)                       # [B, N]
-        z_dot = torch.einsum('bni,bi->bn', z_y, z_mu)   # [B, N]
+            Q = (z_y ** 2).sum(dim=2)                       # [B, N]
+            z_dot = torch.einsum('bni,bi->bn', z_y, z_mu)   # [B, N]
 
-        Q_safe = torch.clamp(Q, min=1e-8)
-        T = z_dot / torch.sqrt(Q_safe)                  # [B, N]
+            Q_safe = torch.clamp(Q, min=1e-8)
+            T = z_dot / torch.sqrt(Q_safe)                  # [B, N]
 
-        # log f = -log(2pi) + angular-Gaussian log kernel
-        log_p = -_LOG_2PI + _ag_log_kernel(Q_safe, mu_Vinv_mu[:, None], T)
-
-        return log_p  # [B, N]
+            # log f = -log(2pi) + angular-Gaussian log kernel
+            log_p = -_LOG_2PI + _ag_log_kernel(Q_safe, mu_Vinv_mu[:, None], T)
+        return log_p.to(orig_dtype)  # [B, N]
 
     def mode(
         self,

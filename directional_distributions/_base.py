@@ -18,6 +18,21 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Mixed-precision helper
+# ---------------------------------------------------------------------------
+
+# Low-precision dtypes whose exp/log/erf normalization math is unstable and must
+# be computed in fp32 instead.
+_LOW_PRECISION = (torch.float16, torch.bfloat16)
+
+
+def _compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Working dtype for sensitive normalization math: upcast fp16/bf16 to fp32,
+    never downcast fp64. Shared by the vMF and angular-Gaussian losses/log-pdfs."""
+    return torch.float32 if dtype in _LOW_PRECISION else dtype
+
+
+# ---------------------------------------------------------------------------
 # Reduction helper for *_nll_loss functions
 # ---------------------------------------------------------------------------
 
@@ -137,6 +152,12 @@ def _construct_orthonormal_basis(mu: Tensor) -> Tuple[Tensor, Tensor]:
 # Cholesky parameterization utilities (used by GAG / GSPC)
 # ---------------------------------------------------------------------------
 
+# Bound on the free log-diagonals so exp() can never overflow to Inf (under low
+# precision or extreme concentration). L_ii ∈ [e⁻¹⁵, e¹⁵] is far outside any
+# physical regime, so this never bites normal training.
+_LOG_DIAG_CLAMP = 15.0
+
+
 def _build_cholesky(pred: Tensor) -> Tensor:
     """Construct the normalised lower-triangular Cholesky factor L from raw
     network outputs.
@@ -160,7 +181,9 @@ def _build_cholesky(pred: Tensor) -> Tensor:
     B = pred.shape[0]
     device, dtype = pred.device, pred.dtype
 
-    log_diag_12 = pred[:, 3:5]   # [B, 2]  → log L₁₁, log L₂₂
+    # Clamp the free log-diagonals so exp() stays finite; det(L) = 1 is
+    # preserved since log L₃₃ = -(clamped sum).
+    log_diag_12 = pred[:, 3:5].clamp(-_LOG_DIAG_CLAMP, _LOG_DIAG_CLAMP)  # [B, 2]  → log L₁₁, log L₂₂
     off_diag = pred[:, 5:8]      # [B, 3]  → L₂₁, L₃₁, L₃₂
 
     # Third log-diagonal fixed by det(L) = 1  ⟹  Σ log Lᵢᵢ = 0
